@@ -1,0 +1,170 @@
+	hw2 - trfs: stackable f/s with operation tracing support
+
+trfs captures records of f/s activity and writes these records to a trace file.
+The trace file is later used to replay the actions from user land.
+
+Design:
+
+Trace records contain all information required to replay a f/s operation.
+Each trace record contains following fields:
+- ID (Unique identifier for a record)
+- Type of record
+- Return value of f/s operation
+- Length of record that follows
+- Variable length record info specific to f/s operation being traced
+
+Following information is stored in super block private data:
+- trace file path
+	This is passed as a mount option using -o tfile=<trace file path>.
+	This path should be outside the lower mounted-on directory.
+- trace bitmap
+	bitmap of operations to be traced. Each bit corresponds to a f/s
+	method. A f/s method would be traced only if its corresponding bit
+	is set.
+	Operations being traced and their bit positions in bitmap:
+	0: create
+	1: mkdir
+	2: read
+	3: rmdir
+	4: unlink
+	5: write
+	6: link
+	7: symlink
+	0xffffffff can be used  to enable tracing of all methods.
+	By default, tracing is enabled for all methods.
+- record number
+	Number of trace records captured so far. This number is used as an
+	identifier for each record.
+- spinlock to protect record number updation and addition of records to
+  work queue by multiple threads
+
+We store following information specific to each f/s method being traced:
+
+->create:
+- mode
+- variable length pathname
+
+->mkdir:
+- mode
+- variable length pathname
+
+->read:
+- pos
+- count
+- variable length pathname
+To replay read, we open file specified in pathname in read only mode,
+reposition file offset to pos using lseek, allocate buffer of count
+bytes and call read syscall.
+
+->write:
+- pos
+- count
+- pathname len
+- variable len buffer containing file name and data to be written
+To replay write, we open the specified file in write only mode,
+reposition file offset to pos using lseek, write the specified data of count
+bytes to file.
+
+->unlink:
+- variable length pathname
+
+->rmdir:
+- variable length pathname
+
+->link:
+- length of old pathname
+- variable length buffer containing old pathname and new pathname
+
+->symlink:
+- length of target name
+- variable length buffer containing target and symlink name
+
+All pathnames contain the terminating '\0'.
+
+trfs maintains a bitmap per mount point to configure which f/s methods
+should be traced. This bitmap can be set and it's current value can be
+retrieved using ioctl. trctl program is used to set/get this bitmap.
+#./trctl /mounted/path
+retrieves current value of bitmap
+
+#./trctl CMD /mounted/path
+sets bitmap where CMD can be none, all, 0xNN (hex number to set bitmap value to)
+
+./trctl can be used to get usage details.
+
+Writing trace records to file:
+trfs uses a single workqueue to write trace records to trace file. We use a
+single thread workqueue to maintain ordering of records within trace file.
+Each method being traced creates a trace record and queues it into the
+workqueue. The work function is called when a trace record is available and
+writes the record to the trace file. trace record is freed by the work function.
+We use a spinlock to set record ID to the next record number and add the record
+to workqueue.
+
+Mounting trfs:
+trfs requires a mandatory mount option tfile which contains the trace file path.
+	mount -t trfs -o tfile=<trace file path> <path to mount> <mount point>
+e.g. mount -t trfs -o tfile=/tmp/tfile1.txt /home/student/ /mnt/trfs
+trace file should be outside the lower mounted on directory.
+
+Replaying trace records:
+The program treplay parses trace file and replays each record one by one.
+treplay requires mandatory parameter TFILE (trace file) and supports 2 optional
+parameter -n and -s. -n can be used to display the trace records without replaying
+them. -s causes the program to abort when the result of replaying an operation
+differs from the captured result of the traced operation. By default, all the
+trace records will be displayed and replayed.
+Use ./treplay to get usage details.
+
+Assumptions & Limitations:
+
+Each mount point has the number of trace records captured and this
+number is used as an identifier for each record. This number is set to 0 on
+mount. Thus, within a single trace session the record IDs will be
+monotonically increasing. If the same trace file is used across multiple
+trace sessions (mount/unmount), the trace file will contain multiple
+sequences of records with monotonically increasing record IDs.
+
+If multiple mount points use same trace file, there would be multiple records
+containing same record ID since record ID is incremental within a particular
+mount point. There would not be any races single a single worker thread writes
+records to the trace file.
+
+The trace file is never truncated. User should backup/rename the trace file
+after unmount else records from a new trace session will continue to be
+appended to same trace file.
+
+Following files are included in this submission:
+
+fs/trfs:
+	Directory containing trfs src code.
+We used wrapfs src code and modified existing files in wrapfs to add
+operation tracing support.
+
+New files added:
+trace.c
+	This file includes all functions required for tracing f/s operations.
+install_module.sh
+	Script used during testing to load module
+
+hw2/:
+
+trace.h
+	Contains all definitions required for tracing. Contains record
+	definitions, enums for record type and bitmap, ioctl definitions.
+	This file is shared between userspace and kernel. Makefile in fs/trfs
+	copies this file during build.
+trctl.c
+	Contains definitions for setting/getting bitmap in trfs.
+treplay.c
+	Contains definitions for replaying records from trace file.
+test/
+	Contains programs/scripts used for testing trfs.
+Makefile
+	Builds executable treplay and trctl.
+kernel.config
+	Config file to build trfs module.
+
+Note:
+Could not remove WARNING: __packed is preferred over __attribute__((packed))
+for trace.h since __packed is not defined in user space. 
